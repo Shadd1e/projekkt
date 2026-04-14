@@ -3,7 +3,7 @@ processor.py
 ============
 Core document processing pipeline:
   1. Extract paragraphs
-  2. Perplexity scoring (AI detection)
+  2. Claude AI detection (replaces local bigram scorer)
   3. Brave + OpenAlex plagiarism check
   4. DeepSeek paraphrase + humanization
   5. Write corrected .docx
@@ -12,20 +12,21 @@ Core document processing pipeline:
 import os
 import re
 import time
-import math
 import requests
-from collections import Counter
+import anthropic
 from openai import OpenAI
 from docx import Document
 from docx.shared import RGBColor
 
-BRAVE_API_KEY    = os.getenv("BRAVE_API_KEY", "")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+BRAVE_API_KEY     = os.getenv("BRAVE_API_KEY", "")
+DEEPSEEK_API_KEY  = os.getenv("DEEPSEEK_API_KEY", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 SIMILARITY_THRESHOLD  = 0.60   # plagiarism word-overlap threshold
-PERPLEXITY_THRESHOLD  = 60.0   # below this = likely AI-written
+AI_CONFIDENCE_MIN     = 0.75   # Claude must be >= 75% confident to flag as AI
 MIN_WORDS             = 15     # skip very short paragraphs
 MAX_PARAPHRASE_PASSES = 2      # second pass for high-confidence matches
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -64,41 +65,50 @@ def extract_paragraphs(filepath: str):
     return result
 
 
-# ── Step 2: Perplexity scorer (AI detection) ──────────────────────────────────
+# ── Step 2: Claude AI detection ───────────────────────────────────────────────
 
-def _bigram_perplexity(text: str) -> float:
+def _score_paragraph_with_claude(text: str, client: anthropic.Anthropic) -> float:
     """
-    Estimate text perplexity using bigram model on the paragraph itself.
-    Lower perplexity = more predictable = more likely AI-written.
-    This is a lightweight proxy for GPTZero-style detection.
+    Ask Claude to score how likely a paragraph was AI-written.
+    Returns a confidence float between 0.0 (human) and 1.0 (AI).
+    Falls back to 0.0 on any error so processing continues.
     """
-    words = re.findall(r'\b\w+\b', text.lower())
-    if len(words) < 4:
-        return 999.0  # too short to score, assume human
-
-    unigrams = Counter(words)
-    bigrams  = Counter(zip(words[:-1], words[1:]))
-    total    = sum(unigrams.values())
-
-    log_prob = 0.0
-    for w1, w2 in zip(words[:-1], words[1:]):
-        p_w1  = unigrams[w1] / total
-        p_w2_given_w1 = (bigrams[(w1, w2)] + 1) / (unigrams[w1] + len(unigrams))  # Laplace
-        log_prob += math.log(p_w2_given_w1 + 1e-10)
-
-    avg_log_prob = log_prob / max(len(words) - 1, 1)
-    perplexity   = math.exp(-avg_log_prob)
-    return round(perplexity, 2)
+    prompt = (
+        "You are an expert AI content detector. Analyse the following paragraph and "
+        "estimate the probability (0.0 to 1.0) that it was written by an AI rather than a human.\n\n"
+        "Consider these signals:\n"
+        "- Overly uniform sentence length and structure\n"
+        "- Excessive use of transitional phrases like 'Furthermore', 'Moreover', 'In conclusion'\n"
+        "- Unnaturally precise or comprehensive coverage of a topic\n"
+        "- Absence of personal voice, hedging, or natural imperfection\n"
+        "- Generic phrasing that could apply to any document on the topic\n\n"
+        "Respond with ONLY a decimal number between 0.0 and 1.0. Nothing else.\n\n"
+        f"Paragraph:\n{text}"
+    )
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=10,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+        score = float(raw)
+        return max(0.0, min(1.0, score))  # clamp to [0, 1]
+    except Exception:
+        return 0.0  # safe default — don't flag if detection fails
 
 
 def score_ai_likelihood(paragraphs: list) -> dict:
     """
-    Returns {list_position: perplexity_score} for all paragraphs.
-    Flags those below PERPLEXITY_THRESHOLD as likely AI-written.
+    Uses Claude to score each paragraph for AI likelihood.
+    Returns {list_position: confidence_score}.
+    Batches with a small delay to respect rate limits.
     """
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     scores = {}
     for pos, (_, text) in enumerate(paragraphs):
-        scores[pos] = _bigram_perplexity(text)
+        scores[pos] = _score_paragraph_with_claude(text, client)
+        time.sleep(0.3)  # small delay between Claude calls
     return scores
 
 
@@ -165,11 +175,11 @@ def check_openalex(text: str) -> tuple:
         best_score, best_url = 0.0, None
 
         for work in results:
-            title   = work.get("title", "") or ""
+            title        = work.get("title", "") or ""
             abstract_inv = work.get("abstract_inverted_index", {}) or {}
-            abstract = " ".join(abstract_inv.keys())
-            snippet  = (title + " " + abstract).lower()
-            s_words  = set(snippet.split())
+            abstract     = " ".join(abstract_inv.keys())
+            snippet      = (title + " " + abstract).lower()
+            s_words      = set(snippet.split())
             if not s_words:
                 continue
             overlap = len(para_words & s_words) / len(para_words)
@@ -258,8 +268,7 @@ def paraphrase(text: str, client, pass_number: int = 1) -> str:
 def humanize(text: str, client) -> str:
     """
     Second-layer humanization pass.
-    Makes AI-paraphrased text sound more naturally human-written
-    by introducing rhythm variation and natural imperfections.
+    Makes AI-paraphrased text sound more naturally human-written.
     """
     prompt = (
         "The paragraph below was rewritten by an AI tool and may still sound artificial. "
@@ -320,7 +329,7 @@ def replace_paragraph_text(para, new_text: str):
         new_run.font.name = font_name
     if font_size:
         new_run.font.size = font_size
-    new_run.font.color.rgb = RGBColor(0, 130, 0)   # green = edited
+    new_run.font.color.rgb = RGBColor(0, 130, 0)  # green = edited
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
@@ -335,38 +344,36 @@ def process_document(input_path: str, output_path: str) -> dict:
 
     total_paragraphs = len(paragraphs)
 
-    # ── AI detection ──────────────────────────────────────────────────────────
-    perplexity_scores  = score_ai_likelihood(paragraphs)
-    ai_flagged_pos     = {
-        pos for pos, score in perplexity_scores.items()
-        if score < PERPLEXITY_THRESHOLD
+    # ── Claude AI detection ───────────────────────────────────────────────────
+    ai_scores     = score_ai_likelihood(paragraphs)
+    ai_flagged_pos = {
+        pos for pos, score in ai_scores.items()
+        if score >= AI_CONFIDENCE_MIN
     }
 
     # ── Internal similarity ───────────────────────────────────────────────────
     internally_flagged = check_internal_similarity(paragraphs)
 
     # ── Web + academic plagiarism ─────────────────────────────────────────────
-    web_flagged      = {}   # {para_doc_index: (url, score)}
-    academic_flagged = {}   # {para_doc_index: (url, score)}
+    web_flagged      = {}
+    academic_flagged = {}
 
     for idx, (para_idx, text) in enumerate(paragraphs):
         if is_reference_entry(text):
             continue
 
-        # Brave web check
         is_web, url, score = check_brave(text)
         if is_web:
             web_flagged[para_idx] = (url, score)
         time.sleep(0.4)
 
-        # OpenAlex academic check
         is_acad, acad_url, acad_score = check_openalex(text)
         if is_acad:
             academic_flagged[para_idx] = (acad_url, acad_score)
         time.sleep(0.3)
 
-    # ── Build master flag set (skip references) ───────────────────────────────
-    all_flagged = set()
+    # ── Build master flag set ─────────────────────────────────────────────────
+    all_flagged  = set()
     skipped_refs = []
 
     for list_pos, (para_idx, text) in enumerate(paragraphs):
@@ -387,40 +394,36 @@ def process_document(input_path: str, output_path: str) -> dict:
                 all_flagged.add(para_idx)
 
     # ── Paraphrase + humanize ─────────────────────────────────────────────────
-    client          = _get_deepseek_client()
-    doc             = Document(input_path)
+    client            = _get_deepseek_client()
+    doc               = Document(input_path)
     paraphrased_count = 0
-    report_items    = []
+    report_items      = []
 
     for i, para in enumerate(doc.paragraphs):
         if i not in all_flagged or not para.text.strip():
             continue
 
-        original = para.text.strip()
-
-        # First paraphrase pass
+        original  = para.text.strip()
         rewritten = paraphrase(original, client, pass_number=1)
         time.sleep(1)
 
-        # Second pass for high web similarity
         if i in web_flagged and web_flagged[i][1] >= 0.75 and MAX_PARAPHRASE_PASSES >= 2:
             rewritten = paraphrase(rewritten, client, pass_number=2)
             time.sleep(1)
 
-        # Humanization layer
         rewritten = humanize(rewritten, client)
         time.sleep(1)
 
         replace_paragraph_text(para, rewritten)
         paraphrased_count += 1
 
-        # Build report entry
-        flags = []
+        flags    = []
         list_pos = next(
             (lp for lp, (pi, _) in enumerate(paragraphs) if pi == i), None
         )
         if list_pos is not None and list_pos in ai_flagged_pos:
-            flags.append(f"AI-written (perplexity: {perplexity_scores.get(list_pos, '?')})")
+            confidence = int(ai_scores.get(list_pos, 0) * 100)
+            flags.append(f"AI-written (Claude confidence: {confidence}%)")
         if list_pos is not None and list_pos in internally_flagged:
             flags.append("Internal repetition")
         if i in web_flagged:
@@ -432,18 +435,17 @@ def process_document(input_path: str, output_path: str) -> dict:
 
         report_items.append({
             "paragraph": i + 1,
-            "preview": original[:100] + ("..." if len(original) > 100 else ""),
-            "flags": flags,
-            "action": "paraphrased",
+            "preview":   original[:100] + ("..." if len(original) > 100 else ""),
+            "flags":     flags,
+            "action":    "paraphrased",
         })
 
-    # References that were flagged but skipped
     for para_idx in skipped_refs:
         report_items.append({
             "paragraph": para_idx + 1,
-            "preview": "",
-            "flags": ["Matched source — skipped (reference entry)"],
-            "action": "skipped",
+            "preview":   "",
+            "flags":     ["Matched source — skipped (reference entry)"],
+            "action":    "skipped",
         })
 
     doc.save(output_path)
@@ -452,5 +454,5 @@ def process_document(input_path: str, output_path: str) -> dict:
         "total_paragraphs_checked": total_paragraphs,
         "paragraphs_paraphrased":   paraphrased_count,
         "references_skipped":       len(skipped_refs),
-        "items": report_items,
+        "items":                    report_items,
     }
