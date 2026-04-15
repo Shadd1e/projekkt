@@ -448,11 +448,85 @@ def process_document(input_path: str, output_path: str) -> dict:
             "action":    "skipped",
         })
 
+    # ── Process table cells ───────────────────────────────────────────────────
+    tables_processed = 0
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    text = para.text.strip()
+                    if not text or len(text.split()) < MIN_WORDS:
+                        continue
+                    if is_reference_entry(text):
+                        continue
+                    # Run plagiarism + AI check on cell text
+                    is_web, _, web_score   = check_brave(text)
+                    is_acad, _, acad_score = check_openalex(text)
+                    time.sleep(0.3)
+
+                    if is_web or is_acad or web_score >= SIMILARITY_THRESHOLD:
+                        rewritten = paraphrase(text, client, pass_number=1)
+                        time.sleep(1)
+                        rewritten = humanize(rewritten, client)
+                        time.sleep(1)
+                        replace_paragraph_text(para, rewritten)
+                        paraphrased_count += 1
+                        tables_processed  += 1
+
     doc.save(output_path)
 
     return {
         "total_paragraphs_checked": total_paragraphs,
         "paragraphs_paraphrased":   paraphrased_count,
+        "tables_cells_rewritten":   tables_processed,
         "references_skipped":       len(skipped_refs),
         "items":                    report_items,
+    }
+
+
+# ── Quick analysis (no AI calls) ──────────────────────────────────────────────
+
+def analyse_document(filepath: str) -> dict:
+    """
+    Fast scan of a .docx file.
+    Returns word count, paragraph count, table count, image count.
+    No AI calls — runs in under a second.
+    """
+    doc = Document(filepath)
+
+    word_count      = 0
+    paragraph_count = 0
+    table_count     = len(doc.tables)
+    image_count     = 0
+
+    # Count words and paragraphs in body text
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if text:
+            words = len(text.split())
+            word_count      += words
+            paragraph_count += 1
+
+    # Count words inside table cells too
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    text = para.text.strip()
+                    if text:
+                        word_count += len(text.split())
+
+    # Count images (inline shapes stored as relationships)
+    try:
+        for rel in doc.part.rels.values():
+            if "image" in rel.reltype:
+                image_count += 1
+    except Exception:
+        pass
+
+    return {
+        "word_count":      word_count,
+        "paragraph_count": paragraph_count,
+        "table_count":     table_count,
+        "image_count":     image_count,
     }
