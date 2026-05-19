@@ -1,34 +1,85 @@
 """
 processor.py
 ============
-Core document processing pipeline:
-  1. Extract paragraphs
-  2. Claude AI detection (replaces local bigram scorer)
-  3. Brave + OpenAlex plagiarism check
-  4. DeepSeek paraphrase + humanization
-  5. Write corrected .docx
+Upgraded pipeline — zero Claude dependency, semantic similarity, real page fetching.
+
+Changes from v1:
+  - AI detection: Claude API → Hugging Face Inference API (free, purpose-built classifier)
+  - Plagiarism: word overlap on snippets → semantic cosine similarity on full page content
+  - Paraphrase + humanize: two DeepSeek calls → one merged call (same quality, half cost)
+  - Internal similarity: word overlap → sentence embeddings via HF API
+  - Table cells: same upgrades applied
+
+Environment variables required:
+    HF_API_KEY=...            ← free at huggingface.co/settings/tokens
+    DEEPSEEK_API_KEY=...
+    BRAVE_API_KEY=...
+    INTERNAL_API_SECRET=...   ← used by main.py, not here
 """
 
 import os
 import re
 import time
 import requests
-import anthropic
+import numpy as np
+from bs4 import BeautifulSoup
 from openai import OpenAI
 from docx import Document
 from docx.shared import RGBColor
 
-BRAVE_API_KEY     = os.getenv("BRAVE_API_KEY", "")
-DEEPSEEK_API_KEY  = os.getenv("DEEPSEEK_API_KEY", "")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+# ── Environment ───────────────────────────────────────────────────────────────
 
-SIMILARITY_THRESHOLD  = 0.60   # plagiarism word-overlap threshold
-AI_CONFIDENCE_MIN     = 0.75   # Claude must be >= 75% confident to flag as AI
-MIN_WORDS             = 15     # skip very short paragraphs
-MAX_PARAPHRASE_PASSES = 2      # second pass for high-confidence matches
+BRAVE_API_KEY    = os.getenv("BRAVE_API_KEY", "")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+HF_API_KEY       = os.getenv("HF_API_KEY", "")
+
+HF_HEADERS = {"Authorization": f"Bearer {HF_API_KEY}"}
+
+# Hugging Face model endpoints
+HF_DETECTOR_URL  = "https://api-inference.huggingface.co/models/Hello-SimpleAI/chatgpt-detector-roberta"
+HF_EMBEDDING_URL = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
+
+# ── Thresholds ────────────────────────────────────────────────────────────────
+
+AI_CONFIDENCE_MIN    = 0.75   # HF detector score to flag as AI-written
+SEMANTIC_THRESHOLD   = 0.72   # cosine similarity to flag as plagiarism
+INTERNAL_SIM_MIN     = 0.80   # internal doc similarity threshold (stricter)
+MIN_WORDS            = 15     # skip very short paragraphs
+PAGE_FETCH_TIMEOUT   = 8      # seconds to wait for a page fetch
+MAX_PAGE_CHARS       = 6000   # chars of page content to embed (keeps cost low)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _get_with_retry(url, headers, params=None, retries=2):
+    for attempt in range(retries + 1):
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=10)
+            r.raise_for_status()
+            return r
+        except Exception:
+            if attempt == retries:
+                return None
+            time.sleep(1.5)
+
+
+def _post_with_retry(url, headers, payload, retries=3):
+    """POST to HF API with retry + model warm-up handling."""
+    for attempt in range(retries + 1):
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=30)
+            if r.status_code == 503:
+                # Model is loading — HF returns estimated_time
+                wait = r.json().get("estimated_time", 20)
+                time.sleep(min(wait, 30))
+                continue
+            r.raise_for_status()
+            return r
+        except Exception:
+            if attempt == retries:
+                return None
+            time.sleep(2)
+
 
 def is_reference_entry(text: str) -> bool:
     """Skip bibliography / reference list entries."""
@@ -65,57 +116,192 @@ def extract_paragraphs(filepath: str):
     return result
 
 
-# ── Step 2: Claude AI detection ───────────────────────────────────────────────
+# ── Step 2: HF AI Detection ───────────────────────────────────────────────────
 
-def _score_paragraph_with_claude(text: str, client: anthropic.Anthropic) -> float:
+def _detect_ai_hf(text: str) -> float:
     """
-    Ask Claude to score how likely a paragraph was AI-written.
-    Returns a confidence float between 0.0 (human) and 1.0 (AI).
-    Falls back to 0.0 on any error so processing continues.
+    Call HF chatgpt-detector-roberta to score a paragraph.
+    Returns float 0.0 (human) to 1.0 (AI).
+    Falls back to 0.0 on failure — never blocks processing.
     """
-    prompt = (
-        "You are an expert AI content detector. Analyse the following paragraph and "
-        "estimate the probability (0.0 to 1.0) that it was written by an AI rather than a human.\n\n"
-        "Consider these signals:\n"
-        "- Overly uniform sentence length and structure\n"
-        "- Excessive use of transitional phrases like 'Furthermore', 'Moreover', 'In conclusion'\n"
-        "- Unnaturally precise or comprehensive coverage of a topic\n"
-        "- Absence of personal voice, hedging, or natural imperfection\n"
-        "- Generic phrasing that could apply to any document on the topic\n\n"
-        "Respond with ONLY a decimal number between 0.0 and 1.0. Nothing else.\n\n"
-        f"Paragraph:\n{text}"
-    )
+    payload = {"inputs": text[:512]}  # model max context
+    r = _post_with_retry(HF_DETECTOR_URL, HF_HEADERS, payload)
+    if r is None:
+        return 0.0
     try:
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=10,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = response.content[0].text.strip()
-        score = float(raw)
-        return max(0.0, min(1.0, score))  # clamp to [0, 1]
+        data = r.json()
+        # Response: [[{"label": "Fake", "score": 0.94}, {"label": "Real", "score": 0.06}]]
+        if isinstance(data, list) and isinstance(data[0], list):
+            for item in data[0]:
+                if item.get("label", "").lower() in ("fake", "ai"):
+                    return float(item["score"])
+        return 0.0
     except Exception:
-        return 0.0  # safe default — don't flag if detection fails
+        return 0.0
 
 
 def score_ai_likelihood(paragraphs: list) -> dict:
     """
-    Uses Claude to score each paragraph for AI likelihood.
-    Returns {list_position: confidence_score}.
-    Batches with a small delay to respect rate limits.
+    Score all paragraphs for AI likelihood via HF API.
+    Returns {list_position: score}.
     """
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     scores = {}
     for pos, (_, text) in enumerate(paragraphs):
-        scores[pos] = _score_paragraph_with_claude(text, client)
-        time.sleep(0.3)  # small delay between Claude calls
+        scores[pos] = _detect_ai_hf(text)
+        time.sleep(0.2)  # light rate limiting
     return scores
 
 
-# ── Step 3: Plagiarism checks ─────────────────────────────────────────────────
+# ── Step 3: Semantic Embeddings via HF ───────────────────────────────────────
+
+def _get_embedding(text: str) -> list | None:
+    """
+    Get sentence embedding from HF all-MiniLM-L6-v2.
+    Returns a list of floats, or None on failure.
+    """
+    payload = {"inputs": text[:512], "options": {"wait_for_model": True}}
+    r = _post_with_retry(HF_EMBEDDING_URL, HF_HEADERS, payload)
+    if r is None:
+        return None
+    try:
+        data = r.json()
+        # Returns a list of floats (the embedding vector)
+        if isinstance(data, list) and isinstance(data[0], float):
+            return data
+        # Sometimes nested: [[float, ...]]
+        if isinstance(data, list) and isinstance(data[0], list):
+            return data[0]
+        return None
+    except Exception:
+        return None
+
+
+def _cosine_similarity(vec_a: list, vec_b: list) -> float:
+    """Cosine similarity between two embedding vectors."""
+    a = np.array(vec_a)
+    b = np.array(vec_b)
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    if denom == 0:
+        return 0.0
+    return float(np.dot(a, b) / denom)
+
+
+def check_internal_similarity(paragraphs: list) -> set:
+    """
+    Flag paragraphs that are semantically too similar to each other.
+    Uses sentence embeddings — catches paraphrased internal repetition.
+    Falls back to word overlap if HF embedding fails.
+    """
+    flagged = set()
+    texts = [t for _, t in paragraphs]
+
+    # Try embedding approach first
+    embeddings = []
+    for text in texts:
+        emb = _get_embedding(text)
+        embeddings.append(emb)
+        time.sleep(0.15)
+
+    if all(e is not None for e in embeddings):
+        for i in range(len(embeddings)):
+            for j in range(i + 1, len(embeddings)):
+                sim = _cosine_similarity(embeddings[i], embeddings[j])
+                if sim >= INTERNAL_SIM_MIN:
+                    flagged.add(i)
+                    flagged.add(j)
+    else:
+        # Fallback: word overlap
+        for i in range(len(texts)):
+            for j in range(i + 1, len(texts)):
+                wi = set(texts[i].lower().split())
+                wj = set(texts[j].lower().split())
+                if not wi or not wj:
+                    continue
+                overlap = len(wi & wj) / min(len(wi), len(wj))
+                if overlap >= 0.60:
+                    flagged.add(i)
+                    flagged.add(j)
+
+    return flagged
+
+
+# ── Step 4: Plagiarism — Web + Academic ──────────────────────────────────────
+
+def _fetch_page_text(url: str) -> str:
+    """
+    Fetch actual page content and strip to clean text.
+    Returns up to MAX_PAGE_CHARS characters.
+    Falls back to empty string on any error.
+    """
+    try:
+        r = requests.get(
+            url,
+            timeout=PAGE_FETCH_TIMEOUT,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                )
+            },
+        )
+        soup = BeautifulSoup(r.text, "html.parser")
+        # Remove boilerplate tags
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
+            tag.decompose()
+        text = soup.get_text(separator=" ", strip=True)
+        # Collapse whitespace
+        text = re.sub(r"\s+", " ", text)
+        return text[:MAX_PAGE_CHARS]
+    except Exception:
+        return ""
+
+
+def _semantic_match(para_text: str, source_text: str) -> float:
+    """
+    Compare paragraph against source text using semantic similarity.
+    Splits source into chunks, scores each against paragraph, returns best score.
+    Falls back to word overlap if embeddings fail.
+    """
+    if not source_text.strip():
+        return 0.0
+
+    para_emb = _get_embedding(para_text)
+    if para_emb is None:
+        # Fallback: word overlap
+        para_words = set(para_text.lower().split())
+        src_words  = set(source_text.lower().split())
+        if not src_words:
+            return 0.0
+        return len(para_words & src_words) / len(para_words)
+
+    # Split source into overlapping chunks of ~300 chars for better coverage
+    chunk_size = 300
+    step       = 150
+    chunks     = [
+        source_text[i : i + chunk_size]
+        for i in range(0, len(source_text), step)
+        if len(source_text[i : i + chunk_size].split()) >= 10
+    ]
+
+    best_score = 0.0
+    for chunk in chunks[:20]:  # cap at 20 chunks to control HF calls
+        chunk_emb = _get_embedding(chunk)
+        if chunk_emb is None:
+            continue
+        score = _cosine_similarity(para_emb, chunk_emb)
+        if score > best_score:
+            best_score = score
+        time.sleep(0.1)
+
+    return best_score
+
 
 def check_brave(text: str) -> tuple:
-    """Check paragraph against live web via Brave Search."""
+    """
+    Search Brave for the paragraph, fetch actual page content,
+    compare semantically. Returns (is_flagged, best_url, best_score).
+    """
     query = text[:120].strip()
     headers = {
         "Accept": "application/json",
@@ -125,164 +311,124 @@ def check_brave(text: str) -> tuple:
     params = {"q": f'"{query}"', "count": 5}
 
     try:
-        r = requests.get(
+        r = _get_with_retry(
             "https://api.search.brave.com/res/v1/web/search",
-            headers=headers, params=params, timeout=10,
+            headers=headers,
+            params=params,
         )
-        if r.status_code != 200:
+        if r is None:
             return False, None, 0.0
 
         results = r.json().get("web", {}).get("results", [])
         if not results:
             return False, None, 0.0
 
-        para_words = set(text.lower().split())
         best_score, best_url = 0.0, None
 
-        for result in results:
-            snippet = result.get("description", "") + " " + result.get("title", "")
-            s_words = set(snippet.lower().split())
-            if not s_words:
-                continue
-            overlap = len(para_words & s_words) / len(para_words)
-            if overlap > best_score:
-                best_score = overlap
-                best_url   = result.get("url", "Unknown source")
+        for result in results[:3]:  # check top 3 URLs
+            url         = result.get("url", "")
+            page_text   = _fetch_page_text(url)
 
-        return best_score >= SIMILARITY_THRESHOLD, best_url, round(best_score, 2)
+            if not page_text:
+                # Fallback to snippet if page fetch fails
+                page_text = result.get("description", "") + " " + result.get("title", "")
+
+            score = _semantic_match(text, page_text)
+            if score > best_score:
+                best_score = score
+                best_url   = url
+
+        return best_score >= SEMANTIC_THRESHOLD, best_url, round(best_score, 2)
 
     except Exception:
         return False, None, 0.0
 
 
 def check_openalex(text: str) -> tuple:
-    """Check paragraph against OpenAlex academic paper database (free)."""
+    """
+    Check paragraph against OpenAlex academic database.
+    Uses semantic similarity against title + abstract.
+    """
     query = text[:100].strip()
     try:
-        r = requests.get(
+        r = _get_with_retry(
             "https://api.openalex.org/works",
+            headers={},
             params={"search": query, "per-page": 5},
-            timeout=10,
         )
-        if r.status_code != 200:
+        if r is None:
             return False, None, 0.0
 
         results = r.json().get("results", [])
         if not results:
             return False, None, 0.0
 
-        para_words = set(text.lower().split())
         best_score, best_url = 0.0, None
 
         for work in results:
             title        = work.get("title", "") or ""
             abstract_inv = work.get("abstract_inverted_index", {}) or {}
             abstract     = " ".join(abstract_inv.keys())
-            snippet      = (title + " " + abstract).lower()
-            s_words      = set(snippet.split())
-            if not s_words:
+            source_text  = (title + " " + abstract).strip()
+
+            if not source_text:
                 continue
-            overlap = len(para_words & s_words) / len(para_words)
-            if overlap > best_score:
-                best_score = overlap
+
+            score = _semantic_match(text, source_text)
+            if score > best_score:
+                best_score = score
                 best_url   = work.get("id", "OpenAlex record")
 
-        return best_score >= SIMILARITY_THRESHOLD, best_url, round(best_score, 2)
+        return best_score >= SEMANTIC_THRESHOLD, best_url, round(best_score, 2)
 
     except Exception:
         return False, None, 0.0
 
 
-def check_internal_similarity(paragraphs: list) -> set:
-    """Flag paragraphs that are too similar to each other within the doc."""
-    flagged = set()
-    texts   = [t for _, t in paragraphs]
-    for i in range(len(texts)):
-        for j in range(i + 1, len(texts)):
-            wi = set(texts[i].lower().split())
-            wj = set(texts[j].lower().split())
-            if not wi or not wj:
-                continue
-            overlap = len(wi & wj) / min(len(wi), len(wj))
-            if overlap >= SIMILARITY_THRESHOLD:
-                flagged.add(i)
-                flagged.add(j)
-    return flagged
-
-
-# ── Step 4: DeepSeek paraphrase + humanization ────────────────────────────────
+# ── Step 5: DeepSeek — Merged Paraphrase + Humanize ─────────────────────────
 
 def _get_deepseek_client():
     return OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 
 
-def paraphrase(text: str, client, pass_number: int = 1) -> str:
-    """Paraphrase a paragraph with DeepSeek."""
-    if pass_number == 1:
-        prompt = (
-            "You are an expert academic writer. Rewrite the following paragraph "
-            "so it is completely original and undetectable as plagiarism. Apply ALL of these:\n\n"
-            "1. Completely restructure every sentence\n"
-            "2. Replace key terms with high-quality synonyms\n"
-            "3. Mix sentence lengths — some short, some complex\n"
-            "4. Alternate active and passive voice\n"
-            "5. Add natural transitional phrases\n"
-            "6. Reorder supporting ideas where logical\n"
-            "7. Preserve all technical terms, numbers, and facts\n"
-            "8. Maintain academic tone\n\n"
-            "Return ONLY the rewritten paragraph. No commentary.\n\n"
-            f"Original:\n{text}"
+def paraphrase_and_humanize(text: str, client, hard_mode: bool = False) -> str:
+    """
+    Single DeepSeek call that paraphrases AND humanizes in one pass.
+    Replaces the old paraphrase() + humanize() two-call pattern.
+    hard_mode=True for paragraphs with very high web similarity (≥0.85).
+    """
+    if hard_mode:
+        instruction = (
+            "This paragraph is almost identical to a web source. "
+            "Rewrite it COMPLETELY from scratch — different structure, different vocabulary, "
+            "different logical flow. Imagine you are explaining this idea to a colleague "
+            "entirely in your own words. Nothing from the original phrasing should survive."
         )
     else:
-        prompt = (
-            "This paragraph still resembles its source too closely. "
-            "Rewrite it completely from scratch using entirely different sentence structures, "
-            "vocabulary, and logical flow. Imagine explaining this to a colleague in your own words. "
-            "Preserve all facts and technical terms but change everything else.\n\n"
-            "Return ONLY the rewritten paragraph. No commentary.\n\n"
-            f"Paragraph:\n{text}"
+        instruction = (
+            "Rewrite the following paragraph so it is completely original "
+            "and passes plagiarism and AI detection tools."
         )
 
-    try:
-        response = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a professional academic editor specialising in making "
-                        "written content completely original while preserving meaning. "
-                        "Return only the requested output with no extra text."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=1024,
-            temperature=0.85,
-        )
-        return response.choices[0].message.content.strip()
-    except Exception:
-        return text
-
-
-def humanize(text: str, client) -> str:
-    """
-    Second-layer humanization pass.
-    Makes AI-paraphrased text sound more naturally human-written.
-    """
     prompt = (
-        "The paragraph below was rewritten by an AI tool and may still sound artificial. "
-        "Your job is to make it sound like it was written by a real human student or researcher. "
-        "Apply these techniques:\n\n"
-        "1. Vary sentence rhythm — mix very short sentences with longer ones\n"
-        "2. Add one or two natural filler phrases humans use (e.g. 'In other words', "
-        "'Put simply', 'It is worth noting')\n"
-        "3. Slightly loosen overly formal phrasing in 1-2 places\n"
-        "4. Introduce minor stylistic asymmetry — not every sentence should be the same length\n"
-        "5. Do NOT change facts, technical terms, or overall meaning\n"
-        "6. Keep academic register — this is still a formal document\n\n"
-        "Return ONLY the humanized paragraph. No commentary.\n\n"
-        f"Paragraph:\n{text}"
+        f"{instruction}\n\n"
+        "Apply ALL of the following in a single pass:\n\n"
+        "ORIGINALITY:\n"
+        "1. Completely restructure every sentence — flip subject/object, split or merge clauses\n"
+        "2. Replace key terms with precise, high-quality synonyms\n"
+        "3. Reorder supporting ideas where the logic still holds\n"
+        "4. Preserve ALL technical terms, numbers, statistics, and facts exactly\n\n"
+        "HUMAN VOICE:\n"
+        "5. Mix sentence lengths — some short and punchy, some long and complex\n"
+        "6. Alternate between active and passive voice naturally\n"
+        "7. Add 1-2 natural transitional phrases a real writer would use\n"
+        "8. Introduce minor stylistic asymmetry — not every sentence the same pattern\n"
+        "9. Slightly loosen 1-2 overly formal phrasings without losing academic register\n\n"
+        "OUTPUT:\n"
+        "- Return ONLY the rewritten paragraph\n"
+        "- No preamble, no commentary, no quotation marks around the output\n"
+        "- Same approximate length as the original\n\n"
+        f"Original paragraph:\n{text}"
     )
 
     try:
@@ -292,21 +438,22 @@ def humanize(text: str, client) -> str:
                 {
                     "role": "system",
                     "content": (
-                        "You are a human writing coach who makes AI-generated academic text "
-                        "sound authentically human. Return only the output with no extra text."
+                        "You are a senior academic editor who rewrites content to be "
+                        "completely original and naturally human-sounding. "
+                        "You output only the rewritten paragraph with zero extra text."
                     ),
                 },
                 {"role": "user", "content": prompt},
             ],
             max_tokens=1024,
-            temperature=0.9,
+            temperature=0.88,
         )
         return response.choices[0].message.content.strip()
     except Exception:
-        return text
+        return text  # safe fallback — return original if DeepSeek fails
 
 
-# ── Step 5: Replace paragraph text in .docx ──────────────────────────────────
+# ── Step 6: Replace paragraph text in .docx ──────────────────────────────────
 
 def replace_paragraph_text(para, new_text: str):
     """Replace paragraph text preserving original formatting, highlight green."""
@@ -344,14 +491,14 @@ def process_document(input_path: str, output_path: str) -> dict:
 
     total_paragraphs = len(paragraphs)
 
-    # ── Claude AI detection ───────────────────────────────────────────────────
-    ai_scores     = score_ai_likelihood(paragraphs)
+    # ── HF AI detection ──────────────────────────────────────────────────────
+    ai_scores = score_ai_likelihood(paragraphs)
     ai_flagged_pos = {
         pos for pos, score in ai_scores.items()
         if score >= AI_CONFIDENCE_MIN
     }
 
-    # ── Internal similarity ───────────────────────────────────────────────────
+    # ── Internal semantic similarity ──────────────────────────────────────────
     internally_flagged = check_internal_similarity(paragraphs)
 
     # ── Web + academic plagiarism ─────────────────────────────────────────────
@@ -365,12 +512,12 @@ def process_document(input_path: str, output_path: str) -> dict:
         is_web, url, score = check_brave(text)
         if is_web:
             web_flagged[para_idx] = (url, score)
-        time.sleep(0.4)
+        time.sleep(0.3)
 
         is_acad, acad_url, acad_score = check_openalex(text)
         if is_acad:
             academic_flagged[para_idx] = (acad_url, acad_score)
-        time.sleep(0.3)
+        time.sleep(0.2)
 
     # ── Build master flag set ─────────────────────────────────────────────────
     all_flagged  = set()
@@ -393,7 +540,7 @@ def process_document(input_path: str, output_path: str) -> dict:
             else:
                 all_flagged.add(para_idx)
 
-    # ── Paraphrase + humanize ─────────────────────────────────────────────────
+    # ── Paraphrase + humanize (merged, single DeepSeek call per paragraph) ────
     client            = _get_deepseek_client()
     doc               = Document(input_path)
     paraphrased_count = 0
@@ -404,15 +551,12 @@ def process_document(input_path: str, output_path: str) -> dict:
             continue
 
         original  = para.text.strip()
-        rewritten = paraphrase(original, client, pass_number=1)
-        time.sleep(1)
 
-        if i in web_flagged and web_flagged[i][1] >= 0.75 and MAX_PARAPHRASE_PASSES >= 2:
-            rewritten = paraphrase(rewritten, client, pass_number=2)
-            time.sleep(1)
+        # Use hard mode if web similarity was very high
+        hard = i in web_flagged and web_flagged[i][1] >= 0.85
 
-        rewritten = humanize(rewritten, client)
-        time.sleep(1)
+        rewritten = paraphrase_and_humanize(original, client, hard_mode=hard)
+        time.sleep(0.8)
 
         replace_paragraph_text(para, rewritten)
         paraphrased_count += 1
@@ -423,15 +567,15 @@ def process_document(input_path: str, output_path: str) -> dict:
         )
         if list_pos is not None and list_pos in ai_flagged_pos:
             confidence = int(ai_scores.get(list_pos, 0) * 100)
-            flags.append(f"AI-written (Claude confidence: {confidence}%)")
+            flags.append(f"AI-written (detector confidence: {confidence}%)")
         if list_pos is not None and list_pos in internally_flagged:
-            flags.append("Internal repetition")
+            flags.append("Internal repetition (semantic)")
         if i in web_flagged:
             url, score = web_flagged[i]
-            flags.append(f"Web match {int(score*100)}% — {url}")
+            flags.append(f"Web match {int(score * 100)}% — {url}")
         if i in academic_flagged:
             url, score = academic_flagged[i]
-            flags.append(f"Academic match {int(score*100)}% — {url}")
+            flags.append(f"Academic match {int(score * 100)}% — {url}")
 
         report_items.append({
             "paragraph": i + 1,
@@ -459,16 +603,15 @@ def process_document(input_path: str, output_path: str) -> dict:
                         continue
                     if is_reference_entry(text):
                         continue
-                    # Run plagiarism + AI check on cell text
+
                     is_web, _, web_score   = check_brave(text)
                     is_acad, _, acad_score = check_openalex(text)
-                    time.sleep(0.3)
+                    time.sleep(0.2)
 
-                    if is_web or is_acad or web_score >= SIMILARITY_THRESHOLD:
-                        rewritten = paraphrase(text, client, pass_number=1)
-                        time.sleep(1)
-                        rewritten = humanize(rewritten, client)
-                        time.sleep(1)
+                    if is_web or is_acad:
+                        hard      = web_score >= 0.85
+                        rewritten = paraphrase_and_humanize(text, client, hard_mode=hard)
+                        time.sleep(0.8)
                         replace_paragraph_text(para, rewritten)
                         paraphrased_count += 1
                         tables_processed  += 1
@@ -499,15 +642,12 @@ def analyse_document(filepath: str) -> dict:
     table_count     = len(doc.tables)
     image_count     = 0
 
-    # Count words and paragraphs in body text
     for para in doc.paragraphs:
         text = para.text.strip()
         if text:
-            words = len(text.split())
-            word_count      += words
+            word_count      += len(text.split())
             paragraph_count += 1
 
-    # Count words inside table cells too
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
@@ -516,7 +656,6 @@ def analyse_document(filepath: str) -> dict:
                     if text:
                         word_count += len(text.split())
 
-    # Count images (inline shapes stored as relationships)
     try:
         for rel in doc.part.rels.values():
             if "image" in rel.reltype:

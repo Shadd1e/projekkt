@@ -34,6 +34,8 @@ TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if INTERNAL_API_SECRET == "change-this-secret":
+        raise RuntimeError("INTERNAL_API_SECRET must be set to a secure value in environment variables.")
     task = asyncio.create_task(schedule_cleanup(TMP_DIR))
     yield
     task.cancel()
@@ -95,7 +97,13 @@ async def process(
     input_path.write_bytes(contents)
 
     try:
-        report = await asyncio.to_thread(process_document, str(input_path), str(output_path))
+        report = await asyncio.wait_for(
+            asyncio.to_thread(process_document, str(input_path), str(output_path)),
+            timeout=300,
+        )
+    except asyncio.TimeoutError:
+        input_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=504, detail="Processing timed out. Try a shorter document.")
     except Exception as e:
         input_path.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
