@@ -456,27 +456,40 @@ def paraphrase_and_humanize(text: str, client, hard_mode: bool = False) -> str:
 # ── Step 6: Replace paragraph text in .docx ──────────────────────────────────
 
 def replace_paragraph_text(para, new_text: str):
-    """Replace paragraph text preserving original formatting, highlight green."""
-    if para.runs:
-        first = para.runs[0]
-        bold, italic, underline = first.bold, first.italic, first.underline
-        font_name, font_size    = first.font.name, first.font.size
-    else:
-        bold = italic = underline = False
-        font_name = font_size = None
+    """
+    Replace paragraph text preserving formatting and document structure integrity.
 
-    for run in para.runs:
-        run._element.getparent().remove(run._element)
+    SAFE APPROACH:
+    - Reuse the first run (keeps its XML element, its formatting, its position
+      in the paragraph's XML tree) and set its text to the full new content.
+    - Delete runs 2..N which are now redundant.
+    - This avoids removing all runs (which can orphan footnote refs, comments,
+      cross-reference fields, and other inline XML elements attached to runs,
+      causing corrupt documents that Word/Google Docs refuse to open).
+    - Images are stored as relationships on the document part, never in runs,
+      so they are untouched regardless.
+    - Table structure (rows, cols, borders, merges) lives outside paragraphs
+      and is never touched by this function.
+    """
+    if not para.runs:
+        # Paragraph has no runs at all (e.g. empty placeholder) — safe to add one
+        new_run = para.add_run(new_text)
+        new_run.font.color.rgb = RGBColor(0, 130, 0)
+        return
 
-    new_run           = para.add_run(new_text)
-    new_run.bold      = bold
-    new_run.italic    = italic
-    new_run.underline = underline
-    if font_name:
-        new_run.font.name = font_name
-    if font_size:
-        new_run.font.size = font_size
-    new_run.font.color.rgb = RGBColor(0, 130, 0)  # green = edited
+    # Reuse the first run — preserves bold, italic, underline, font name/size,
+    # and critically its position in the XML tree (no orphaned fields)
+    first_run = para.runs[0]
+    first_run.text = new_text
+    first_run.font.color.rgb = RGBColor(0, 130, 0)  # green = edited
+
+    # Remove runs 1..N — they are now redundant since all text is in run 0.
+    # Use list() to avoid mutating the list while iterating it.
+    for run in list(para.runs[1:]):
+        try:
+            run._element.getparent().remove(run._element)
+        except Exception:
+            pass  # If a run has no parent (already removed), skip silently
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
@@ -668,4 +681,108 @@ def analyse_document(filepath: str) -> dict:
         "paragraph_count": paragraph_count,
         "table_count":     table_count,
         "image_count":     image_count,
+    }
+
+
+# ── Pre-scan (AI detection + similarity, NO rewriting) ────────────────────────
+
+def prescan_document(filepath: str) -> dict:
+    """
+    Run the full detection pipeline (AI detection, internal similarity,
+    web plagiarism, academic plagiarism) but DO NOT rewrite anything.
+
+    Returns only the count of flagged sections and the word count of those
+    sections — so the frontend can calculate an exact cost before the user
+    commits to a fix.
+
+    This is the function that powers the 'scan first, pay only for what needs
+    fixing' UX. It uses the same thresholds and same logic as process_document
+    so the cost shown at scan time exactly matches the cost charged at fix time.
+
+    Typically takes 15–90 seconds depending on document length and API latency.
+    Costs: HF API calls only (free). DeepSeek is NOT called here.
+    """
+    doc        = Document(filepath)
+    paragraphs = extract_paragraphs(filepath)   # [(doc_index, text), ...]
+
+    if not paragraphs:
+        return {
+            "total_paragraphs":   0,
+            "flagged_sections":   0,
+            "flagged_word_count": 0,
+            "total_word_count":   0,
+            "issues": {
+                "ai_written":    0,
+                "web_plagiarism": 0,
+                "academic":      0,
+                "internal_copy": 0,
+            },
+        }
+
+    # ── Run detection steps (same as process_document, no rewriting) ──────────
+
+    # Step 1: AI detection scores
+    ai_scores = score_ai_likelihood(paragraphs)
+
+    # Step 2: Internal similarity
+    internally_similar = check_internal_similarity(paragraphs)
+
+    # Step 3: Web plagiarism
+    web_flagged = set()
+    for pos, (_, text) in enumerate(paragraphs):
+        if is_reference_entry(text):
+            continue
+        if check_web_plagiarism(text):
+            web_flagged.add(pos)
+
+    # Step 4: Academic plagiarism
+    academic_flagged = set()
+    for pos, (_, text) in enumerate(paragraphs):
+        if is_reference_entry(text):
+            continue
+        if check_academic_plagiarism(text):
+            academic_flagged.add(pos)
+
+    # ── Collate flagged positions ─────────────────────────────────────────────
+    ai_flagged = {pos for pos, score in ai_scores.items() if score >= AI_CONFIDENCE_MIN}
+
+    all_flagged = ai_flagged | internally_similar | web_flagged | academic_flagged
+
+    # Count flagged words — this is what we charge for
+    flagged_word_count = 0
+    for pos in all_flagged:
+        if pos < len(paragraphs):
+            _, text = paragraphs[pos]
+            flagged_word_count += len(text.split())
+
+    # Also count table cell words that would be flagged
+    # (table cells go through the same pipeline in process_document)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    text = para.text.strip()
+                    if not text or len(text.split()) < MIN_WORDS:
+                        continue
+                    if is_reference_entry(text):
+                        continue
+                    # Quick AI check on table cells
+                    score = _detect_ai_hf(text)
+                    if score >= AI_CONFIDENCE_MIN:
+                        flagged_word_count += len(text.split())
+
+    # Total word count (for display)
+    total_word_count = sum(len(t.split()) for _, t in paragraphs)
+
+    return {
+        "total_paragraphs":   len(paragraphs),
+        "flagged_sections":   len(all_flagged),
+        "flagged_word_count": flagged_word_count,
+        "total_word_count":   total_word_count,
+        "issues": {
+            "ai_written":     len(ai_flagged),
+            "web_plagiarism": len(web_flagged),
+            "academic":       len(academic_flagged),
+            "internal_copy":  len(internally_similar),
+        },
     }

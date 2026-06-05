@@ -23,7 +23,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Background
 from fastapi.responses import FileResponse, JSONResponse
 from dotenv import load_dotenv
 
-from processor import process_document, analyse_document
+from processor import process_document, analyse_document, prescan_document
 from cleanup import schedule_cleanup
 
 load_dotenv()
@@ -69,6 +69,41 @@ async def analyse(
 
     try:
         result = await asyncio.to_thread(analyse_document, str(tmp_path))
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    return JSONResponse(result)
+
+
+# ── Pre-scan endpoint (detection only, no rewriting) ─────────────────────────
+@app.post("/prescan")
+async def prescan(
+    file: UploadFile = File(...),
+    x_internal_secret: str = Header(...),
+):
+    """
+    Run full AI + plagiarism detection on the document but do NOT rewrite
+    anything. Returns flagged section count + flagged word count so the
+    frontend can show the user exactly what needs fixing and what it will cost
+    — before they commit credits.
+
+    Typically takes 15–90s. Uses HF API only (free). DeepSeek not called.
+    """
+    if x_internal_secret != INTERNAL_API_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if not file.filename.endswith(".docx"):
+        raise HTTPException(status_code=400, detail="Only .docx files are accepted.")
+
+    contents = await file.read()
+    if len(contents) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File exceeds 10MB limit.")
+
+    job_id   = str(uuid.uuid4())
+    tmp_path = TMP_DIR / f"{job_id}_prescan.docx"
+    tmp_path.write_bytes(contents)
+
+    try:
+        result = await asyncio.to_thread(prescan_document, str(tmp_path))
     finally:
         tmp_path.unlink(missing_ok=True)
 
