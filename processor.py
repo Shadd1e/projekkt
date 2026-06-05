@@ -732,7 +732,8 @@ def prescan_document(filepath: str) -> dict:
     for pos, (_, text) in enumerate(paragraphs):
         if is_reference_entry(text):
             continue
-        if check_web_plagiarism(text):
+        matched, _ = check_brave(text)
+        if matched:
             web_flagged.add(pos)
 
     # Step 4: Academic plagiarism
@@ -740,7 +741,8 @@ def prescan_document(filepath: str) -> dict:
     for pos, (_, text) in enumerate(paragraphs):
         if is_reference_entry(text):
             continue
-        if check_academic_plagiarism(text):
+        matched, _ = check_openalex(text)
+        if matched:
             academic_flagged.add(pos)
 
     # ── Collate flagged positions ─────────────────────────────────────────────
