@@ -732,7 +732,7 @@ def prescan_document(filepath: str) -> dict:
     for pos, (_, text) in enumerate(paragraphs):
         if is_reference_entry(text):
             continue
-        matched, _ = check_brave(text)
+        matched, _, _ = check_brave(text)
         if matched:
             web_flagged.add(pos)
 
@@ -741,7 +741,7 @@ def prescan_document(filepath: str) -> dict:
     for pos, (_, text) in enumerate(paragraphs):
         if is_reference_entry(text):
             continue
-        matched, _ = check_openalex(text)
+        matched, _, _ = check_openalex(text)
         if matched:
             academic_flagged.add(pos)
 
