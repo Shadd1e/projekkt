@@ -20,6 +20,7 @@ Environment variables required:
 import os
 import re
 import time
+import asyncio
 import requests
 import numpy as np
 from bs4 import BeautifulSoup
@@ -774,6 +775,182 @@ def prescan_document(filepath: str) -> dict:
                         flagged_word_count += len(text.split())
 
     # Total word count (for display)
+    total_word_count = sum(len(t.split()) for _, t in paragraphs)
+
+    return {
+        "total_paragraphs":   len(paragraphs),
+        "flagged_sections":   len(all_flagged),
+        "flagged_word_count": flagged_word_count,
+        "total_word_count":   total_word_count,
+        "issues": {
+            "ai_written":     len(ai_flagged),
+            "web_plagiarism": len(web_flagged),
+            "academic":       len(academic_flagged),
+            "internal_copy":  len(internally_similar),
+        },
+    }
+
+
+# ── Async pre-scan (parallelized — used by the new background job system) ────
+
+MAX_PARAGRAPHS = 40   # hard cap — roughly one chapter
+
+async def prescan_document_async(filepath: str) -> dict:
+    """
+    Same detection logic as prescan_document() but runs concurrently:
+
+      • AI detection  — batches of 10 paragraphs in parallel
+      • Embeddings    — batches of 15 paragraphs in parallel, then O(n²) compare
+      • Web+Academic  — batches of 3 non-AI-flagged paragraphs in parallel
+                        (web and academic run concurrently per paragraph)
+
+    Raises ValueError if paragraph count exceeds MAX_PARAGRAPHS.
+    Never raises on API failures — falls back to 0.0 / empty sets.
+    """
+    doc        = Document(filepath)
+    paragraphs = extract_paragraphs(filepath)   # [(doc_index, text), ...]
+
+    _empty = {
+        "total_paragraphs":   0,
+        "flagged_sections":   0,
+        "flagged_word_count": 0,
+        "total_word_count":   0,
+        "issues": {
+            "ai_written":     0,
+            "web_plagiarism": 0,
+            "academic":       0,
+            "internal_copy":  0,
+        },
+    }
+
+    if not paragraphs:
+        return _empty
+
+    if len(paragraphs) > MAX_PARAGRAPHS:
+        raise ValueError(
+            f"Document has {len(paragraphs)} checkable paragraphs "
+            f"(max {MAX_PARAGRAPHS} — please submit one chapter at a time)."
+        )
+
+    # ── Step 1: AI detection — batches of 10 in parallel ─────────────────────
+    BATCH_AI = 10
+    ai_scores: dict[int, float] = {}
+
+    for start in range(0, len(paragraphs), BATCH_AI):
+        batch = paragraphs[start : start + BATCH_AI]
+        results = await asyncio.gather(*[
+            asyncio.to_thread(_detect_ai_hf, text)
+            for _, text in batch
+        ])
+        for i, score in enumerate(results):
+            ai_scores[start + i] = score
+        if start + BATCH_AI < len(paragraphs):
+            await asyncio.sleep(0.4)   # brief pause between batches
+
+    ai_flagged = {pos for pos, score in ai_scores.items() if score >= AI_CONFIDENCE_MIN}
+
+    # ── Step 2: Internal similarity — embeddings in batches of 15 ────────────
+    BATCH_EMB = 15
+    embeddings: list = [None] * len(paragraphs)
+
+    for start in range(0, len(paragraphs), BATCH_EMB):
+        batch = paragraphs[start : start + BATCH_EMB]
+        results = await asyncio.gather(*[
+            asyncio.to_thread(_get_embedding, text)
+            for _, text in batch
+        ])
+        for i, emb in enumerate(results):
+            embeddings[start + i] = emb
+        if start + BATCH_EMB < len(paragraphs):
+            await asyncio.sleep(0.3)
+
+    internally_similar: set[int] = set()
+    if all(e is not None for e in embeddings):
+        for i in range(len(embeddings)):
+            for j in range(i + 1, len(embeddings)):
+                if _cosine_similarity(embeddings[i], embeddings[j]) >= INTERNAL_SIM_MIN:
+                    internally_similar.add(i)
+                    internally_similar.add(j)
+    else:
+        # Fallback: word-overlap
+        texts = [t for _, t in paragraphs]
+        for i in range(len(texts)):
+            for j in range(i + 1, len(texts)):
+                wi = set(texts[i].lower().split())
+                wj = set(texts[j].lower().split())
+                if wi and wj and len(wi & wj) / min(len(wi), len(wj)) >= 0.60:
+                    internally_similar.add(i)
+                    internally_similar.add(j)
+
+    # ── Step 3+4: Web + academic — batches of 3 concurrently ─────────────────
+    # Skip paragraphs already flagged by AI detection (they're flagged regardless)
+    # and reference entries (they match sources by design).
+    BATCH_PLAG = 3
+    web_flagged:      set[int] = set()
+    academic_flagged: set[int] = set()
+
+    candidates = [
+        (pos, text)
+        for pos, (_, text) in enumerate(paragraphs)
+        if pos not in ai_flagged and not is_reference_entry(text)
+    ]
+
+    for start in range(0, len(candidates), BATCH_PLAG):
+        batch = candidates[start : start + BATCH_PLAG]
+
+        # For each paragraph in the batch run web AND academic concurrently
+        tasks = []
+        for _, text in batch:
+            tasks.append(asyncio.to_thread(check_brave,    text))
+            tasks.append(asyncio.to_thread(check_openalex, text))
+
+        results = await asyncio.gather(*tasks)
+
+        for i, (pos, _) in enumerate(batch):
+            web_match,  _, _ = results[i * 2]
+            acad_match, _, _ = results[i * 2 + 1]
+            if web_match:
+                web_flagged.add(pos)
+            if acad_match:
+                academic_flagged.add(pos)
+
+        if start + BATCH_PLAG < len(candidates):
+            await asyncio.sleep(0.5)
+
+    # ── Collate ───────────────────────────────────────────────────────────────
+    all_flagged = ai_flagged | internally_similar | web_flagged | academic_flagged
+
+    flagged_word_count = sum(
+        len(paragraphs[pos][1].split())
+        for pos in all_flagged
+        if pos < len(paragraphs)
+    )
+
+    # Table cells — quick AI check only, batches of 10
+    table_texts = [
+        para.text.strip()
+        for table in doc.tables
+        for row   in table.rows
+        for cell  in row.cells
+        for para  in cell.paragraphs
+        if para.text.strip() and
+           len(para.text.strip().split()) >= MIN_WORDS and
+           not is_reference_entry(para.text.strip())
+    ]
+
+    if table_texts:
+        BATCH_TBL = 10
+        for start in range(0, len(table_texts), BATCH_TBL):
+            batch   = table_texts[start : start + BATCH_TBL]
+            scores  = await asyncio.gather(*[
+                asyncio.to_thread(_detect_ai_hf, t) for t in batch
+            ])
+            for t, score in zip(batch, scores):
+                if score >= AI_CONFIDENCE_MIN:
+                    flagged_word_count += len(t.split())
+            if start + BATCH_TBL < len(table_texts):
+                await asyncio.sleep(0.3)
+
     total_word_count = sum(len(t.split()) for _, t in paragraphs)
 
     return {

@@ -2,9 +2,11 @@
 Shaddies Checker — Python Microservice
 =======================================
 FastAPI service that:
-1. /analyse  — quick scan: word count, tables, images, price quote
-2. /process  — full pipeline: AI detection, plagiarism, paraphrase, humanize
-3. /download — serve processed file
+1. /analyse       — quick scan: word count, tables, images, price quote
+2. /prescan       — starts a background detection job; returns job_id immediately
+3. /job-status    — poll for prescan result
+4. /process       — full pipeline: AI detection, plagiarism, paraphrase, humanize
+5. /download      — serve processed file
 
 Environment variables required (.env):
     HF_API_KEY=...
@@ -16,14 +18,22 @@ Environment variables required (.env):
 import os
 import uuid
 import asyncio
+import time
 from pathlib import Path
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header
 from fastapi.responses import FileResponse, JSONResponse
 from dotenv import load_dotenv
 
-from processor import process_document, analyse_document, prescan_document
+from processor import (
+    process_document,
+    analyse_document,
+    prescan_document,
+    prescan_document_async,
+    extract_paragraphs,
+    MAX_PARAGRAPHS,
+)
 from cleanup import schedule_cleanup
 
 load_dotenv()
@@ -31,6 +41,38 @@ load_dotenv()
 INTERNAL_API_SECRET = os.getenv("INTERNAL_API_SECRET", "change-this-secret")
 TMP_DIR = Path("/tmp/shaddies")
 TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+# ── In-memory job store ───────────────────────────────────────────────────────
+# Railway is a persistent server — this dict survives across requests.
+# Keys: railway job_id (str)
+# Values: { "status": "processing"|"done"|"failed", "result": dict|None,
+#            "error": str|None, "created_at": float }
+_prescan_jobs: dict = {}
+
+
+def _cleanup_old_jobs():
+    """Remove jobs older than 2 hours to prevent unbounded memory growth."""
+    cutoff = time.time() - 7200
+    stale  = [jid for jid, j in _prescan_jobs.items() if j["created_at"] < cutoff]
+    for jid in stale:
+        _prescan_jobs.pop(jid, None)
+
+
+async def _run_prescan_job(job_id: str, filepath: Path):
+    """Background task: run the async prescan pipeline, update job store."""
+    try:
+        result = await prescan_document_async(str(filepath))
+        _prescan_jobs[job_id] = {**_prescan_jobs[job_id], "status": "done", "result": result}
+    except ValueError as e:
+        # Paragraph limit exceeded or document unreadable
+        _prescan_jobs[job_id] = {**_prescan_jobs[job_id], "status": "failed", "error": str(e)}
+    except Exception as e:
+        _prescan_jobs[job_id] = {**_prescan_jobs[job_id], "status": "failed", "error": "Scan failed internally."}
+        print(f"[prescan job {job_id}] unexpected error: {e}")
+    finally:
+        filepath.unlink(missing_ok=True)
+        _cleanup_old_jobs()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -40,7 +82,8 @@ async def lifespan(app: FastAPI):
     yield
     task.cancel()
 
-app = FastAPI(title="Shaddies Checker", version="2.0.0", lifespan=lifespan)
+
+app = FastAPI(title="Shaddies Checker", version="3.0.0", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -63,8 +106,8 @@ async def analyse(
     if len(contents) > 10 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="File exceeds 10MB limit.")
 
-    job_id    = str(uuid.uuid4())
-    tmp_path  = TMP_DIR / f"{job_id}_scan.docx"
+    job_id   = str(uuid.uuid4())
+    tmp_path = TMP_DIR / f"{job_id}_scan.docx"
     tmp_path.write_bytes(contents)
 
     try:
@@ -75,19 +118,16 @@ async def analyse(
     return JSONResponse(result)
 
 
-# ── Pre-scan endpoint (detection only, no rewriting) ─────────────────────────
+# ── Pre-scan: start job, return immediately ───────────────────────────────────
 @app.post("/prescan")
 async def prescan(
     file: UploadFile = File(...),
     x_internal_secret: str = Header(...),
 ):
     """
-    Run full AI + plagiarism detection on the document but do NOT rewrite
-    anything. Returns flagged section count + flagged word count so the
-    frontend can show the user exactly what needs fixing and what it will cost
-    — before they commit credits.
-
-    Typically takes 15–90s. Uses HF API only (free). DeepSeek not called.
+    Accepts a .docx file, validates it, then immediately returns a job_id.
+    The actual scan runs as a background asyncio task.
+    Poll /job-status/{job_id} for results.
     """
     if x_internal_secret != INTERNAL_API_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
@@ -98,22 +138,61 @@ async def prescan(
     if len(contents) > 10 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="File exceeds 10MB limit.")
 
+    # Save to temp file so we can read it in the background task
     job_id   = str(uuid.uuid4())
     tmp_path = TMP_DIR / f"{job_id}_prescan.docx"
     tmp_path.write_bytes(contents)
 
+    # Quick paragraph count check — reject before starting any AI work
     try:
-        result = await asyncio.to_thread(prescan_document, str(tmp_path))
-    finally:
+        paragraphs = extract_paragraphs(str(tmp_path))
+    except Exception:
         tmp_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Could not read document.")
 
-    return JSONResponse(result)
+    if len(paragraphs) > MAX_PARAGRAPHS:
+        tmp_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Document has {len(paragraphs)} checkable paragraphs "
+                f"(max {MAX_PARAGRAPHS} — please submit one chapter at a time)."
+            ),
+        )
+
+    # Register job in store and fire off background task
+    _prescan_jobs[job_id] = {
+        "status":     "processing",
+        "result":     None,
+        "error":      None,
+        "created_at": time.time(),
+    }
+    asyncio.create_task(_run_prescan_job(job_id, tmp_path))
+
+    return JSONResponse({"job_id": job_id, "status": "processing"}, status_code=202)
+
+
+# ── Pre-scan status poll ──────────────────────────────────────────────────────
+@app.get("/job-status/{job_id}")
+def job_status(job_id: str, x_internal_secret: str = Header(...)):
+    if x_internal_secret != INTERNAL_API_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    job = _prescan_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    if job["status"] == "done":
+        return JSONResponse({"status": "done", "result": job["result"]})
+    if job["status"] == "failed":
+        return JSONResponse({"status": "failed", "error": job.get("error", "Scan failed.")})
+
+    return JSONResponse({"status": "processing"})
 
 
 # ── Full processing endpoint ──────────────────────────────────────────────────
 @app.post("/process")
 async def process(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     x_internal_secret: str = Header(...),
 ):
