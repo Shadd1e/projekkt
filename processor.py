@@ -82,6 +82,148 @@ def _post_with_retry(url, headers, payload, retries=3):
             time.sleep(2)
 
 
+def _detect_ai_hf_batch(texts: list) -> list:
+    """
+    Batch AI detection — sends all texts in ONE HF request.
+    Returns list of float scores (0.0 = human, 1.0 = AI), same order as input.
+    Falls back to 0.0 for any text that fails.
+    HF classifier accepts {"inputs": ["text1", "text2", ...]} and returns
+    [[{label, score}, ...], [{label, score}, ...], ...].
+    """
+    truncated = [t[:512] for t in texts]
+    r = _post_with_retry(HF_DETECTOR_URL, HF_HEADERS, {"inputs": truncated})
+    if r is None:
+        return [0.0] * len(texts)
+    try:
+        data = r.json()
+        scores = []
+        for item in data:
+            score = 0.0
+            if isinstance(item, list):
+                for label_obj in item:
+                    if label_obj.get("label", "").lower() in ("fake", "ai"):
+                        score = float(label_obj["score"])
+            scores.append(score)
+        # Pad with 0.0 if HF returned fewer results than expected
+        while len(scores) < len(texts):
+            scores.append(0.0)
+        return scores
+    except Exception:
+        return [0.0] * len(texts)
+
+
+def _get_embeddings_batch(texts: list) -> list:
+    """
+    Batch embeddings — sends all texts in ONE HF request.
+    Returns list of embedding vectors (or None on failure), same order as input.
+    HF sentence-transformers accepts {"inputs": ["text1", "text2", ...]}
+    and returns [[float, ...], [float, ...], ...].
+    """
+    truncated = [t[:512] for t in texts]
+    r = _post_with_retry(
+        HF_EMBEDDING_URL, HF_HEADERS,
+        {"inputs": truncated, "options": {"wait_for_model": True}}
+    )
+    if r is None:
+        return [None] * len(texts)
+    try:
+        data = r.json()
+        if isinstance(data, list) and len(data) > 0:
+            # data is [[float,...], [float,...], ...]
+            if isinstance(data[0], list) and isinstance(data[0][0], float):
+                result = data
+                while len(result) < len(texts):
+                    result.append(None)
+                return result
+        return [None] * len(texts)
+    except Exception:
+        return [None] * len(texts)
+
+
+def _word_overlap(a: str, b: str) -> float:
+    """Simple word overlap ratio — used as fast fallback for prescan plagiarism."""
+    wa = set(a.lower().split())
+    wb = set(b.lower().split())
+    if not wa or not wb:
+        return 0.0
+    return len(wa & wb) / min(len(wa), len(wb))
+
+
+def check_brave_fast(text: str) -> tuple:
+    """
+    Lightweight Brave check for prescan — NO page fetches, NO embeddings.
+    Just searches Brave and checks word overlap against snippets/titles.
+    Much faster than check_brave(); good enough to flag suspicious content
+    during a scan (deep semantic check runs at fix time).
+    Returns (is_flagged, best_url, best_score).
+    """
+    FAST_THRESHOLD = 0.35   # lower than SEMANTIC_THRESHOLD since it's word overlap
+    query = text[:120].strip()
+    headers = {
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        "X-Subscription-Token": BRAVE_API_KEY,
+    }
+    params = {"q": f'"{query}"', "count": 5}
+    try:
+        r = _get_with_retry(
+            "https://api.search.brave.com/res/v1/web/search",
+            headers=headers, params=params,
+        )
+        if r is None:
+            return False, None, 0.0
+        results = r.json().get("web", {}).get("results", [])
+        if not results:
+            return False, None, 0.0
+        best_score, best_url = 0.0, None
+        for result in results[:3]:
+            snippet = (result.get("description", "") + " " + result.get("title", "")).strip()
+            if not snippet:
+                continue
+            score = _word_overlap(text, snippet)
+            if score > best_score:
+                best_score = score
+                best_url   = result.get("url", "")
+        return best_score >= FAST_THRESHOLD, best_url, round(best_score, 2)
+    except Exception:
+        return False, None, 0.0
+
+
+def check_openalex_fast(text: str) -> tuple:
+    """
+    Lightweight OpenAlex check for prescan — word overlap only, no embeddings.
+    Returns (is_flagged, best_url, best_score).
+    """
+    FAST_THRESHOLD = 0.35
+    query = text[:100].strip()
+    try:
+        r = _get_with_retry(
+            "https://api.openalex.org/works",
+            headers={},
+            params={"search": query, "per-page": 5},
+        )
+        if r is None:
+            return False, None, 0.0
+        results = r.json().get("results", [])
+        if not results:
+            return False, None, 0.0
+        best_score, best_url = 0.0, None
+        for work in results:
+            title        = work.get("title", "") or ""
+            abstract_inv = work.get("abstract_inverted_index", {}) or {}
+            abstract     = " ".join(abstract_inv.keys())
+            source_text  = (title + " " + abstract).strip()
+            if not source_text:
+                continue
+            score = _word_overlap(text, source_text)
+            if score > best_score:
+                best_score = score
+                best_url   = work.get("id", "OpenAlex record")
+        return best_score >= FAST_THRESHOLD, best_url, round(best_score, 2)
+    except Exception:
+        return False, None, 0.0
+
+
 def is_reference_entry(text: str) -> bool:
     """Skip bibliography / reference list entries."""
     patterns = [
@@ -832,48 +974,44 @@ async def prescan_document_async(filepath: str) -> dict:
             f"(max {MAX_PARAGRAPHS} — please submit one chapter at a time)."
         )
 
-    # ── Step 1: AI detection — batches of 10 in parallel ─────────────────────
-    BATCH_AI = 10
-    ai_scores: dict[int, float] = {}
+    texts = [t for _, t in paragraphs]
 
-    for start in range(0, len(paragraphs), BATCH_AI):
-        batch = paragraphs[start : start + BATCH_AI]
-        results = await asyncio.gather(*[
-            asyncio.to_thread(_detect_ai_hf, text)
-            for _, text in batch
-        ])
-        for i, score in enumerate(results):
-            ai_scores[start + i] = score
-        if start + BATCH_AI < len(paragraphs):
-            await asyncio.sleep(0.4)   # brief pause between batches
+    # ── Step 1: AI detection — ONE batch request to HF ───────────────────────
+    # HF classifier accepts multiple inputs in a single POST and returns all
+    # scores at once. 30 paragraphs = 1 HTTP call instead of 30.
+    BATCH_AI = 25   # HF allows up to ~50 inputs per request; keep conservative
+    ai_score_list: list = []
 
+    for start in range(0, len(texts), BATCH_AI):
+        batch   = texts[start : start + BATCH_AI]
+        scores  = await asyncio.to_thread(_detect_ai_hf_batch, batch)
+        ai_score_list.extend(scores)
+        if start + BATCH_AI < len(texts):
+            await asyncio.sleep(0.5)
+
+    ai_scores  = {i: s for i, s in enumerate(ai_score_list)}
     ai_flagged = {pos for pos, score in ai_scores.items() if score >= AI_CONFIDENCE_MIN}
 
-    # ── Step 2: Internal similarity — embeddings in batches of 15 ────────────
-    BATCH_EMB = 15
-    embeddings: list = [None] * len(paragraphs)
+    # ── Step 2: Internal similarity — ONE batch embedding request ─────────────
+    BATCH_EMB = 25
+    all_embeddings: list = []
 
-    for start in range(0, len(paragraphs), BATCH_EMB):
-        batch = paragraphs[start : start + BATCH_EMB]
-        results = await asyncio.gather(*[
-            asyncio.to_thread(_get_embedding, text)
-            for _, text in batch
-        ])
-        for i, emb in enumerate(results):
-            embeddings[start + i] = emb
-        if start + BATCH_EMB < len(paragraphs):
+    for start in range(0, len(texts), BATCH_EMB):
+        batch = texts[start : start + BATCH_EMB]
+        embs  = await asyncio.to_thread(_get_embeddings_batch, batch)
+        all_embeddings.extend(embs)
+        if start + BATCH_EMB < len(texts):
             await asyncio.sleep(0.3)
 
-    internally_similar: set[int] = set()
-    if all(e is not None for e in embeddings):
-        for i in range(len(embeddings)):
-            for j in range(i + 1, len(embeddings)):
-                if _cosine_similarity(embeddings[i], embeddings[j]) >= INTERNAL_SIM_MIN:
+    internally_similar: set = set()
+    if all(e is not None for e in all_embeddings):
+        for i in range(len(all_embeddings)):
+            for j in range(i + 1, len(all_embeddings)):
+                if _cosine_similarity(all_embeddings[i], all_embeddings[j]) >= INTERNAL_SIM_MIN:
                     internally_similar.add(i)
                     internally_similar.add(j)
     else:
         # Fallback: word-overlap
-        texts = [t for _, t in paragraphs]
         for i in range(len(texts)):
             for j in range(i + 1, len(texts)):
                 wi = set(texts[i].lower().split())
@@ -882,12 +1020,13 @@ async def prescan_document_async(filepath: str) -> dict:
                     internally_similar.add(i)
                     internally_similar.add(j)
 
-    # ── Step 3+4: Web + academic — batches of 3 concurrently ─────────────────
-    # Skip paragraphs already flagged by AI detection (they're flagged regardless)
-    # and reference entries (they match sources by design).
-    BATCH_PLAG = 3
-    web_flagged:      set[int] = set()
-    academic_flagged: set[int] = set()
+    # ── Step 3+4: Plagiarism — fast snippet-only checks, concurrent ───────────
+    # Uses check_brave_fast / check_openalex_fast (no page fetches, no embeddings).
+    # Full semantic plagiarism runs only at fix time (process_document).
+    # Skip paragraphs already flagged by AI — they're flagged regardless.
+    BATCH_PLAG = 5
+    web_flagged:      set = set()
+    academic_flagged: set = set()
 
     candidates = [
         (pos, text)
@@ -897,12 +1036,11 @@ async def prescan_document_async(filepath: str) -> dict:
 
     for start in range(0, len(candidates), BATCH_PLAG):
         batch = candidates[start : start + BATCH_PLAG]
-
-        # For each paragraph in the batch run web AND academic concurrently
+        # Web and academic run concurrently for every paragraph in the batch
         tasks = []
         for _, text in batch:
-            tasks.append(asyncio.to_thread(check_brave,    text))
-            tasks.append(asyncio.to_thread(check_openalex, text))
+            tasks.append(asyncio.to_thread(check_brave_fast,    text))
+            tasks.append(asyncio.to_thread(check_openalex_fast, text))
 
         results = await asyncio.gather(*tasks)
 
@@ -915,7 +1053,7 @@ async def prescan_document_async(filepath: str) -> dict:
                 academic_flagged.add(pos)
 
         if start + BATCH_PLAG < len(candidates):
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
 
     # ── Collate ───────────────────────────────────────────────────────────────
     all_flagged = ai_flagged | internally_similar | web_flagged | academic_flagged
@@ -926,7 +1064,7 @@ async def prescan_document_async(filepath: str) -> dict:
         if pos < len(paragraphs)
     )
 
-    # Table cells — quick AI check only, batches of 10
+    # Table cells — batch AI check only
     table_texts = [
         para.text.strip()
         for table in doc.tables
@@ -939,12 +1077,10 @@ async def prescan_document_async(filepath: str) -> dict:
     ]
 
     if table_texts:
-        BATCH_TBL = 10
+        BATCH_TBL = 25
         for start in range(0, len(table_texts), BATCH_TBL):
-            batch   = table_texts[start : start + BATCH_TBL]
-            scores  = await asyncio.gather(*[
-                asyncio.to_thread(_detect_ai_hf, t) for t in batch
-            ])
+            batch  = table_texts[start : start + BATCH_TBL]
+            scores = await asyncio.to_thread(_detect_ai_hf_batch, batch)
             for t, score in zip(batch, scores):
                 if score >= AI_CONFIDENCE_MIN:
                     flagged_word_count += len(t.split())
