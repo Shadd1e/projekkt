@@ -37,8 +37,8 @@ HF_API_KEY       = os.getenv("HF_API_KEY", "")
 HF_HEADERS = {"Authorization": f"Bearer {HF_API_KEY}"}
 
 # Hugging Face model endpoints
-HF_DETECTOR_URL  = "https://api-inference.huggingface.co/models/Hello-SimpleAI/chatgpt-detector-roberta"
-HF_EMBEDDING_URL = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
+HF_DETECTOR_URL  = "https://router.huggingface.co/hf-inference/models/Hello-SimpleAI/chatgpt-detector-roberta"
+HF_EMBEDDING_URL = "https://router.huggingface.co/hf-inference/models/sentence-transformers/all-MiniLM-L6-v2"
 
 # ── Thresholds ────────────────────────────────────────────────────────────────
 
